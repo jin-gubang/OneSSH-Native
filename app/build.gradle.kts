@@ -82,6 +82,7 @@ val appVersionCode: Int =
 android {
     namespace = "com.onessh.app"
     compileSdk = 36
+    ndkVersion = "29.0.14206865"
 
     defaultConfig {
         applicationId = "com.onessh.app"
@@ -90,6 +91,14 @@ android {
         // 两个值都由上面的 version.properties 推算出来，这里不再写死数字
         versionCode = appVersionCode
         versionName = appVersionName
+    }
+
+    // pty 桥（Mosh 子进程用）：src/main/cpp/CMakeLists.txt，编出 libptybridge.so。
+    // 打包进 APK 的 mosh-client 二进制在 src/main/jniLibs/<abi>/，不用编。
+    externalNativeBuild {
+        cmake {
+            path = file("src/main/cpp/CMakeLists.txt")
+        }
     }
 
     compileOptions {

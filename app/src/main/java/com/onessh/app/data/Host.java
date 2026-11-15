@@ -23,6 +23,8 @@ public class Host {
     public String keyId = "";
     /** 跳板机：先连这台，再从它转发到目标主机 */
     public String jumpId = "";
+    /** 用 Mosh 而不用 SSH 连这台主机（需服务器装 mosh-server 并放行 UDP 端口） */
+    public boolean mosh;
 
     public String passwordEnc = "";
     public String keyEnc = "";
@@ -56,6 +58,7 @@ public class Host {
             o.put("credId", credId);
             o.put("keyId", keyId);
             o.put("jumpId", jumpId);
+            o.put("mosh", mosh);
             o.put("passwordEnc", passwordEnc);
             o.put("keyEnc", keyEnc);
             o.put("passphraseEnc", passphraseEnc);
@@ -79,6 +82,7 @@ public class Host {
         h.credId = o.optString("credId", "");
         h.keyId = o.optString("keyId", "");
         h.jumpId = o.optString("jumpId", "");
+        h.mosh = o.optBoolean("mosh", false);
         h.passwordEnc = o.optString("passwordEnc", "");
         h.keyEnc = o.optString("keyEnc", "");
         h.passphraseEnc = o.optString("passphraseEnc", "");

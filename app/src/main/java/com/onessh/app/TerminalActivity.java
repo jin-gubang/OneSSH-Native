@@ -23,6 +23,7 @@ import com.onessh.app.data.Host;
 import com.onessh.app.data.Snippet;
 import com.onessh.app.data.Store;
 import com.onessh.app.ssh.HostKeyPrompt;
+import com.onessh.app.ssh.MoshSession;
 import com.onessh.app.ssh.SshSession;
 import com.onessh.app.term.TermColors;
 import com.onessh.app.term.TerminalView;
@@ -48,6 +49,7 @@ public class TerminalActivity extends Activity implements TerminalView.Listener 
     private Host host;
     private String hostId;
     private SshSession session;
+    private MoshSession moshSession;
 
     private TerminalView term;
     private LinearLayout overlay;
@@ -176,7 +178,7 @@ public class TerminalActivity extends Activity implements TerminalView.Listener 
         bar.setPadding(UI.dp(4), UI.dp(6), UI.dp(4), UI.dp(6));
 
         View back = Widgets.barIcon(this, "back", UI.TERM_FG, () -> {
-            if (session != null && session.isConnected()) askDisconnect();
+            if (anyConnected()) askDisconnect();
             else finish();
         });
         bar.addView(back);
@@ -362,6 +364,9 @@ public class TerminalActivity extends Activity implements TerminalView.Listener 
 
     private void connect() {
         if (session != null) session.close();
+        if (moshSession != null) moshSession.close();
+        session = null;
+        moshSession = null;
         showOverlay("connecting", getString(R.string.connecting), null);
         setStatus("connecting", getString(R.string.connecting));
 
@@ -371,7 +376,8 @@ public class TerminalActivity extends Activity implements TerminalView.Listener 
             return;
         }
 
-        session = new SshSession(cfg, new SshSession.Listener() {
+        // SSH 和 Mosh 共用同一套输出/状态回调，终端侧不用区分走哪条路
+        SshSession.Listener listener = new SshSession.Listener() {
             @Override
             public void onOutput(byte[] data) {
                 if (term != null) term.feed(data);
@@ -381,7 +387,17 @@ public class TerminalActivity extends Activity implements TerminalView.Listener 
             public void onState(String state, String message) {
                 runOnUiThread(() -> handleState(state, message));
             }
-        }, this::verifyHostKey);
+        };
+
+        if (host != null && host.mosh) {
+            moshSession = new MoshSession(this, cfg, listener, this::verifyHostKey);
+            Thread t = new Thread(moshSession::connect, "mosh-connect");
+            t.setDaemon(true);
+            t.start();
+            return;
+        }
+
+        session = new SshSession(cfg, listener, this::verifyHostKey);
 
         Thread t = new Thread(session::connect, "ssh-connect");
         t.setDaemon(true);
@@ -393,7 +409,9 @@ public class TerminalActivity extends Activity implements TerminalView.Listener 
         switch (state) {
             case "connected":
                 hideOverlay();
-                setStatus("connected", getString(R.string.connected));
+                setStatus("connected", moshSession != null
+                        ? getString(R.string.connected) + " · Mosh"
+                        : getString(R.string.connected));
                 if (host != null) store.touchHost(host.id);
                 break;
             case "closed":
@@ -424,20 +442,28 @@ public class TerminalActivity extends Activity implements TerminalView.Listener 
 
     @Override
     public void onInput(byte[] data) {
-        SshSession s = session;
-        if (s != null) s.write(data);
+        if (moshSession != null) moshSession.write(data);
+        else if (session != null) session.write(data);
     }
 
     @Override
     public void onResize(int cols, int rows) {
-        SshSession s = session;
-        if (s != null) s.resize(cols, rows);
+        if (moshSession != null) moshSession.resize(cols, rows);
+        else if (session != null) session.resize(cols, rows);
     }
 
     private void write(String s) {
-        SshSession sess = session;
-        if (sess == null) return;
-        sess.write(s.getBytes(StandardCharsets.UTF_8));
+        if (moshSession != null) {
+            moshSession.write(s.getBytes(StandardCharsets.UTF_8));
+        } else if (session != null) {
+            session.write(s.getBytes(StandardCharsets.UTF_8));
+        }
+    }
+
+    /** SSH 或 Mosh 任一会话连着就算连上 */
+    private boolean anyConnected() {
+        return (session != null && session.isConnected())
+                || (moshSession != null && moshSession.isConnected());
     }
 
     private void moreMenu() {
@@ -475,7 +501,7 @@ public class TerminalActivity extends Activity implements TerminalView.Listener 
      * 只有连上之后才能最小化；还没连上时点了也没意义。
      */
     private void minimize() {
-        if (session == null || !session.isConnected()) {
+        if (!anyConnected()) {
             UI.toast(this, "还没连上，等连接成功再最小化");
             return;
         }
@@ -712,9 +738,11 @@ public class TerminalActivity extends Activity implements TerminalView.Listener 
             term.setFontSizeSp(sizes[idx]);
             store.setFontSize(sizes[idx]);
             term.post(() -> {
-                if (session != null && term.buffer() != null) {
-                    session.resize(term.buffer().cols, term.buffer().rows);
-                }
+                if (term.buffer() == null) return;
+                int cols = term.buffer().cols;
+                int rows = term.buffer().rows;
+                if (moshSession != null) moshSession.resize(cols, rows);
+                else if (session != null) session.resize(cols, rows);
             });
         });
     }
@@ -733,13 +761,14 @@ public class TerminalActivity extends Activity implements TerminalView.Listener 
         Dialogs.confirm(this, "断开连接", "当前会话会立即结束，远端正在跑的任务可能被中断。",
                 "断开", true, () -> {
                     if (session != null) session.close();
+                    if (moshSession != null) moshSession.close();
                     finish();
                 });
     }
 
     @Override
     public void onBackPressed() {
-        if (session != null && session.isConnected()) askDisconnect();
+        if (anyConnected()) askDisconnect();
         else super.onBackPressed();
     }
 
@@ -749,6 +778,7 @@ public class TerminalActivity extends Activity implements TerminalView.Listener 
         // 登记也要清掉，主机列表上的悬浮卡片才不会变成死按钮。
         SessionRegistry.clearIf(this);
         if (session != null) session.close();
+        if (moshSession != null) moshSession.close();
         super.onDestroy();
     }
 
