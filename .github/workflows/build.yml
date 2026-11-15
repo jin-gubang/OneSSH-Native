@@ -107,7 +107,7 @@ jobs:
 
       # 构建这一刻，Gradle 会把 version.properties 的 patch / build 各 +1。
       # PR 与标签构建不需要新版本号，用 -PnoBump 锁住。
-      - name: 编译 Debug / Release（自动递增版本号）
+      - name: 编译可安装的 Debug APK（自动递增版本号）
         env:
           NO_BUMP_REF: ${{ github.ref_type == 'tag' || github.event_name == 'pull_request' }}
         run: |-
@@ -116,7 +116,7 @@ jobs:
             BUMP_FLAG="-PnoBump"
             echo "本次构建不递增版本号（PR 或标签构建）"
           fi
-          ./gradlew assembleDebug assembleRelease --no-daemon --stacktrace $BUMP_FLAG
+          ./gradlew assembleDebug --no-daemon --stacktrace $BUMP_FLAG
 
       - name: 读取构建出的版本号
         id: version
@@ -179,28 +179,19 @@ jobs:
           "$ANDROID_HOME/build-tools/36.0.0/apksigner" verify --print-certs \
             app/build/outputs/apk/debug/app-debug.apk | grep -i "SHA-256"
 
-      - name: 归档带版本号的 APK
+      - name: 归档带版本号的可安装 APK
         run: |-
           V="${{ steps.version.outputs.name }}"
           mkdir -p dist
           cp app/build/outputs/apk/debug/app-debug.apk "dist/OneSSH-${V}-debug.apk"
-          cp app/build/outputs/apk/release/app-release-unsigned.apk "dist/OneSSH-${V}-release-unsigned.apk"
           ls -lh dist
           sha256sum dist/*.apk
 
-      - name: 上传 Debug APK（可直接安装）
+      - name: 上传 APK（可直接安装）
         uses: actions/upload-artifact@v4
         with:
           name: OneSSH-${{ steps.version.outputs.name }}-debug
-          path: dist/*-debug.apk
-          if-no-files-found: error
-          retention-days: 30
-
-      - name: 上传 Release APK（未签名）
-        uses: actions/upload-artifact@v4
-        with:
-          name: OneSSH-${{ steps.version.outputs.name }}-release-unsigned
-          path: dist/*-release-unsigned.apk
+          path: dist/OneSSH-${{ steps.version.outputs.name }}-debug.apk
           if-no-files-found: error
           retention-days: 30
 
