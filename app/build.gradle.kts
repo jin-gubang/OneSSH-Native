@@ -19,6 +19,14 @@ plugins {
 
 val versionFile: File = rootProject.file("version.properties")
 
+/* 固定的 debug 签名：仓库里有一份调试 keystore（app/debug.keystore.base64）。
+ * CI 在构建前把它解码到 app/debug.keystore；只要该文件存在，debug 包就用它签名，
+ * 指纹固定，可覆盖安装。本地没有该文件时沿用 AGP 默认的 $HOME/.android/debug.keystore。
+ * 注意：只靠工作流往 $HOME/.android 写文件是靠不住的——实测两版 CI 包用了不同的
+ * 现生成 key（指纹 61fcdfa5… / 63aacd4c…，与仓库 key 的 7d795239… 都不同），
+ * 所以这里显式指定签名配置，不依赖默认路径。*/
+val fixedDebugKeystore: File = rootProject.file("app/debug.keystore")
+
 val versionProps = Properties().apply {
     if (versionFile.exists()) versionFile.inputStream().use { load(it) }
 }
@@ -104,6 +112,17 @@ android {
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_17
         targetCompatibility = JavaVersion.VERSION_17
+    }
+
+    signingConfigs {
+        getByName("debug") {
+            if (fixedDebugKeystore.exists()) {
+                storeFile = fixedDebugKeystore
+                storePassword = "android"
+                keyAlias = "androiddebugkey"
+                keyPassword = "android"
+            }
+        }
     }
 
     buildTypes {

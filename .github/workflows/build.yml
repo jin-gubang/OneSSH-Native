@@ -96,9 +96,13 @@ jobs:
       - name: 固定 debug 签名
         run: |-
           # runner 每次全新，AGP 默认会现生成 debug.keystore，导致每次签名不同、
-          # 手机上无法覆盖安装。用仓库内固定的调试密钥覆盖默认路径。
+          # 手机上无法覆盖安装。把仓库内固定的调试密钥解码到 app/debug.keystore，
+          # build.gradle.kts 会显式用它签 debug 包；同时也覆盖默认路径做兜底。
+          # 注意：只写默认路径并不可靠，实测两版 CI 包指纹各不相同（61fcdfa5… /
+          # 63aacd4c…，与仓库 key 的 7d795239… 都不同），所以不要只依赖它。
+          base64 -d app/debug.keystore.base64 > app/debug.keystore
           mkdir -p "$HOME/.android"
-          base64 -d app/debug.keystore.base64 > "$HOME/.android/debug.keystore"
+          cp app/debug.keystore "$HOME/.android/debug.keystore"
 
       - name: 打印构建环境
         run: |-
@@ -176,8 +180,16 @@ jobs:
 
       - name: 校验 debug 签名指纹
         run: |-
-          "$ANDROID_HOME/build-tools/36.0.0/apksigner" verify --print-certs \
-            app/build/outputs/apk/debug/app-debug.apk | grep -i "SHA-256"
+          # 期望指纹取自仓库 keystore；实测签名必须与它一致，否则构建失败。
+          # 只打印不比对等于没校验——之前固定签名失效就是这么漏过去的。
+          EXPECTED=$("$JAVA_HOME/bin/keytool" -list -v -keystore app/debug.keystore -storepass android 2>/dev/null | grep -i "SHA256" | awk '{print $2}' | tr -d ':' | tr '[:upper:]' '[:lower:]')
+          ACTUAL=$("$ANDROID_HOME/build-tools/36.0.0/apksigner" verify --print-certs app/build/outputs/apk/debug/app-debug.apk | grep -i "SHA-256" | awk '{print $NF}' | tr '[:upper:]' '[:lower:]')
+          echo "期望指纹：$EXPECTED"
+          echo "实际指纹：$ACTUAL"
+          if [ -z "$EXPECTED" ] || [ "$EXPECTED" != "$ACTUAL" ]; then
+            echo "::error::debug 签名指纹与仓库 keystore 不一致，固定签名失效"
+            exit 1
+          fi
 
       - name: 归档带版本号的可安装 APK
         run: |-
