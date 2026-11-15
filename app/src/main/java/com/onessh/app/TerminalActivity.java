@@ -57,6 +57,7 @@ public class TerminalActivity extends Activity implements TerminalView.Listener 
 
     private TerminalView term;
     private LinearLayout overlay;
+    private LinearLayout selectionBar;
     private LinearLayout keysBar;
     private TextView ctrlKey;
     private TextView titleText;
@@ -112,6 +113,17 @@ public class TerminalActivity extends Activity implements TerminalView.Listener 
         overlay.setBackgroundColor(0xF2070910);
         termWrap.addView(overlay, new FrameLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
+
+        // 文字选中的操作栏：平时藏着，进选中模式才贴在终端底部
+        selectionBar = buildSelectionBar();
+        FrameLayout.LayoutParams slp = new FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        slp.gravity = Gravity.BOTTOM;
+        slp.leftMargin = UI.dp(12);
+        slp.rightMargin = UI.dp(12);
+        slp.bottomMargin = UI.dp(10);
+        termWrap.addView(selectionBar, slp);
+        selectionBar.setVisibility(View.GONE);
 
         keysBar = buildKeys();
         content.addView(keysBar);
@@ -847,26 +859,34 @@ public class TerminalActivity extends Activity implements TerminalView.Listener 
         snippetEditor(fresh);
     }
 
-    /** 长按终端：高亮按住的那一行，弹菜单让用户复制该行、复制全部输出，或把它存成片段 */
+    /** 长按终端：高亮按住的那一行，弹菜单让用户复制该行、拖选文字、复制全部输出，或把它存成片段 */
     @Override
-    public void onLongPress(float y) {
+    public void onLongPress(float x, float y) {
         if (term == null) return;
         String line = term.lineTextAt(y);
         if (line == null || line.trim().isEmpty()) {
-            term.clearSelection();
-            UI.toast(this, "这一行是空的");
+            // 空行上长按：只能从这里开始拖选文字
+            Dialogs.sheet(this, "这一行是空的",
+                    new String[]{"复制文字"},
+                    new String[]{"copy"}, -1, idx -> {
+                        term.clearSelection();
+                        term.startTextSelection(x, y);
+                    });
             return;
         }
         String preview = line.length() > 40 ? line.substring(0, 40) + "…" : line;
         Dialogs.sheet(this, preview,
-                new String[]{"复制该行", "复制全部输出", "加片段"},
-                new String[]{"copy", "copy", "plus"}, -1, idx -> {
+                new String[]{"复制该行", "复制文字", "复制全部输出", "加片段"},
+                new String[]{"copy", "copy", "copy", "plus"}, -1, idx -> {
                     term.clearSelection();
                     switch (idx) {
                         case 0:
                             copyText(line, "已复制该行");
                             break;
                         case 1:
+                            term.startTextSelection(x, y);
+                            break;
+                        case 2:
                             copyAll();
                             break;
                         default:
@@ -874,6 +894,49 @@ public class TerminalActivity extends Activity implements TerminalView.Listener 
                             break;
                     }
                 });
+    }
+
+    /** 文字选中模式的开关：进模式显示底部复制栏，退出就收起来 */
+    @Override
+    public void onTextSelection(boolean active) {
+        if (selectionBar != null) {
+            selectionBar.setVisibility(active ? View.VISIBLE : View.GONE);
+        }
+    }
+
+    private LinearLayout buildSelectionBar() {
+        LinearLayout bar = UI.row(this);
+        bar.setGravity(Gravity.CENTER_VERTICAL);
+        bar.setBackground(UI.bg(UI.CARD, 12f, UI.LINE, 1f));
+        bar.setElevation(UI.dp(4f));
+        UI.padding(bar, 12, 10, 12, 10);
+
+        TextView hint = UI.text(this, "拖动两端圆点调整选区", 12f, UI.MUTED);
+        bar.addView(hint);
+        UI.weight(hint, 1f);
+
+        LinearLayout copy = Widgets.button(this, "复制", "copy", true);
+        copy.setOnClickListener(v -> copySelection());
+        bar.addView(copy);
+
+        LinearLayout cancel = Widgets.button(this, "取消", null, false);
+        Widgets.margins(cancel, 8, 0, 0, 0);
+        cancel.setOnClickListener(v -> {
+            if (term != null) term.clearTextSelection();
+        });
+        bar.addView(cancel);
+        return bar;
+    }
+
+    private void copySelection() {
+        if (term == null) return;
+        String text = term.selectedText();
+        if (text == null || text.isEmpty()) {
+            UI.toast(this, "选中的内容是空的");
+            return;
+        }
+        copyText(text, "已复制");
+        term.clearTextSelection();
     }
 
     private void copyText(String text, String toast) {
@@ -944,6 +1007,8 @@ public class TerminalActivity extends Activity implements TerminalView.Listener 
 
     private void showOverlay(String state, String title, String detail) {
         if (overlay == null) return;
+        // 连接状态变了，正在选的文字就作废，复制栏也收起来
+        if (term != null) term.clearTextSelection();
         overlay.removeAllViews();
         overlay.setVisibility(View.VISIBLE);
 

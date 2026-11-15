@@ -451,12 +451,58 @@ public final class TerminalBuffer {
 
     /** 按“回滚区 + 当前屏”的统一行号取一行文本，越界返回 null；长按复制用 */
     public String lineTextAt(int index) {
+        Line l = lineAtIndex(index);
+        return l == null ? null : rowText(l);
+    }
+
+    /** 按统一行号取行，越界返回 null */
+    public Line lineAtIndex(int index) {
         int sb = scrollbackSize();
         if (index < 0) return null;
-        if (index < sb) return rowText(scrollbackAt(index));
+        if (index < sb) return scrollbackAt(index);
         int r = index - sb;
         if (r < 0 || r >= rows) return null;
-        return rowText(lines[r]);
+        return lines[r];
+    }
+
+    /**
+     * 取起止单元格之间的文本（起止都是闭区间，含起止格）。
+     * 跨行时行与行之间补一个换行；每行去掉行尾空格。
+     * 起点落在宽字符的第二格时回退到它的第一格，保证宽字符整个进或出。
+     */
+    public String textInRange(int startIndex, int startCol, int endIndex, int endCol) {
+        if (startIndex > endIndex
+                || (startIndex == endIndex && startCol > endCol)) {
+            int ti = startIndex;
+            int tc = startCol;
+            startIndex = endIndex;
+            startCol = endCol;
+            endIndex = ti;
+            endCol = tc;
+        }
+        StringBuilder sb = new StringBuilder();
+        for (int index = startIndex; index <= endIndex; index++) {
+            Line l = lineAtIndex(index);
+            if (l == null) continue;
+            int from = index == startIndex ? startCol : 0;
+            int to = index == endIndex ? endCol : cols - 1;
+            from = Math.max(0, Math.min(cols - 1, from));
+            to = Math.max(0, Math.min(cols - 1, to));
+            if (from > to) continue;
+            // 起点在宽字符的第二格：回退到第一格，字符整个算进来
+            if ((l.at[from] & ATTR_WIDE_TAIL) != 0 && from > 0) from--;
+            int last = -1;
+            for (int i = from; i <= to; i++) {
+                if (l.cp[i] != ' ' || l.bg[i] != DEFAULT_BG) last = i;
+            }
+            for (int i = from; i <= last; i++) {
+                if ((l.at[i] & ATTR_WIDE_TAIL) != 0) continue;
+                int c = l.cp[i];
+                sb.appendCodePoint(c == 0 ? ' ' : c);
+            }
+            if (index < endIndex) sb.append('\n');
+        }
+        return sb.toString();
     }
 
     private String rowText(Line l) {
