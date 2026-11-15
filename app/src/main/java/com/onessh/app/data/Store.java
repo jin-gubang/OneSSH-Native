@@ -11,6 +11,7 @@ import java.io.File;
 import java.io.FileInputStream;
 import java.io.FileOutputStream;
 import java.nio.charset.StandardCharsets;
+import java.security.SecureRandom;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.LinkedHashMap;
@@ -217,6 +218,18 @@ public final class Store {
             root.put("groups", next);
         } catch (Exception ignored) {
         }
+        // 分组改名，id 映射跟着改名，id 本身不变，导出还是同一个 groupId
+        JSONObject ids = obj("hostGroupIds");
+        java.util.Iterator<String> it = ids.keys();
+        while (it.hasNext()) {
+            String k = it.next();
+            if (from.equals(ids.optString(k, ""))) {
+                try {
+                    ids.put(k, target);
+                } catch (Exception ignored) {
+                }
+            }
+        }
         int moved = 0;
         for (Host h : hosts()) {
             if (from.equals(h.group)) {
@@ -240,6 +253,14 @@ public final class Store {
             root.put("groups", next);
         } catch (Exception ignored) {
         }
+        JSONObject ids = obj("hostGroupIds");
+        java.util.List<String> dead = new java.util.ArrayList<>();
+        java.util.Iterator<String> it = ids.keys();
+        while (it.hasNext()) {
+            String k = it.next();
+            if (name.equals(ids.optString(k, ""))) dead.add(k);
+        }
+        for (String k : dead) ids.remove(k);
         int moved = 0;
         for (Host h : hosts()) {
             if (name.equals(h.group)) {
@@ -250,6 +271,60 @@ public final class Store {
         }
         persist();
         return moved;
+    }
+
+    /* ---------------------------------------------- 主机分组 id（导入/导出用） */
+
+    /**
+     * 主机分组在 App 里只认名字，导入/导出格式里认 groupId。
+     * 这里存一份 id → 名字的映射，导出时同一个分组永远是同一个 id，
+     * 导入时按 id 认出已有的分组（对端改了名字也认得出来）。
+     */
+    public synchronized String hostGroupId(String name) {
+        String g = name == null ? "" : name.trim();
+        if (g.isEmpty()) return "";
+        JSONObject ids = obj("hostGroupIds");
+        java.util.Iterator<String> it = ids.keys();
+        while (it.hasNext()) {
+            String k = it.next();
+            if (g.equals(ids.optString(k, ""))) return k;
+        }
+        String id = newGroupId();
+        try {
+            ids.put(id, g);
+        } catch (Exception ignored) {
+        }
+        persist();
+        return id;
+    }
+
+    public synchronized String hostGroupNameForId(String id) {
+        if (id == null || id.isEmpty()) return null;
+        String name = obj("hostGroupIds").optString(id, "");
+        return name.isEmpty() ? null : name;
+    }
+
+    public synchronized void setHostGroupId(String id, String name) {
+        String g = name == null ? "" : name.trim();
+        if (id == null || id.isEmpty() || g.isEmpty()) return;
+        try {
+            obj("hostGroupIds").put(id, g);
+        } catch (Exception ignored) {
+        }
+        addGroup(g);
+        persist();
+    }
+
+    /** 24 位十六进制 id，跟示例里的 groupId 一个样子。 */
+    private static String newGroupId() {
+        byte[] b = new byte[12];
+        new SecureRandom().nextBytes(b);
+        StringBuilder sb = new StringBuilder(24);
+        for (byte v : b) {
+            sb.append(Character.forDigit((v >> 4) & 0xF, 16));
+            sb.append(Character.forDigit(v & 0xF, 16));
+        }
+        return sb.toString();
     }
 
     /* ------------------------------------------------------------- 凭据 */
