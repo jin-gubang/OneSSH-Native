@@ -1,11 +1,11 @@
-保证跨平台 clone 后 gradlew 仍可直接执行（LF），Windows 批处理保持 CRLF
+# 保证跨平台 clone 后 gradlew 仍可直接执行（LF），Windows 批处理保持 CRLF
 text=auto
 gradlew text eol=lf
 *.sh text eol=lf
 gradlew.bat text eol=crlf
 *.bat text eol=crlf
 
-二进制文件禁止任何换行/编码转换
+# 二进制文件禁止任何换行/编码转换
 *.jar binary
 *.jks binary
 *.keystore binary
