@@ -418,6 +418,76 @@ public final class Store {
         persist();
     }
 
+    /* ------------------------------------------------------------- 片段分组 */
+
+    public synchronized List<SnippetGroup> snippetGroups() {
+        List<SnippetGroup> out = new ArrayList<>();
+        JSONArray a = arr("snippetGroups");
+        for (int i = 0; i < a.length(); i++) {
+            JSONObject o = a.optJSONObject(i);
+            if (o != null) out.add(SnippetGroup.fromJson(o));
+        }
+        Collections.sort(out, (x, y) -> {
+            if (x.createdAt != y.createdAt) return Long.compare(x.createdAt, y.createdAt);
+            return x.name.compareToIgnoreCase(y.name);
+        });
+        return out;
+    }
+
+    public synchronized SnippetGroup snippetGroup(String key) {
+        if (key == null || key.isEmpty()) return null;
+        for (SnippetGroup g : snippetGroups()) if (g.key.equals(key)) return g;
+        return null;
+    }
+
+    public synchronized void saveSnippetGroup(SnippetGroup g) {
+        if (g.key == null || g.key.isEmpty()) {
+            g.key = "g" + Long.toString(System.currentTimeMillis(), 36)
+                    + Integer.toString((int) (Math.random() * 1e6), 36);
+        }
+        if (g.createdAt == 0) g.createdAt = System.currentTimeMillis();
+        JSONArray a = arr("snippetGroups");
+        boolean replaced = false;
+        for (int i = 0; i < a.length(); i++) {
+            JSONObject o = a.optJSONObject(i);
+            if (o != null && g.key.equals(o.optString("key"))) {
+                try {
+                    a.put(i, g.toJson());
+                    replaced = true;
+                } catch (Exception ignored) {
+                }
+                break;
+            }
+        }
+        if (!replaced) a.put(g.toJson());
+        persist();
+    }
+
+    /** 删除分组：里面的片段不删除，移到未分组。 */
+    public synchronized void deleteSnippetGroup(String key) {
+        JSONArray a = arr("snippetGroups");
+        JSONArray next = new JSONArray();
+        for (int i = 0; i < a.length(); i++) {
+            JSONObject o = a.optJSONObject(i);
+            if (o != null && !key.equals(o.optString("key"))) next.put(o);
+        }
+        try {
+            root.put("snippetGroups", next);
+        } catch (Exception ignored) {
+        }
+        JSONArray s = arr("snippets");
+        for (int i = 0; i < s.length(); i++) {
+            JSONObject o = s.optJSONObject(i);
+            if (o != null && key.equals(o.optString("groupKey"))) {
+                try {
+                    o.put("groupKey", "");
+                } catch (Exception ignored) {
+                }
+            }
+        }
+        persist();
+    }
+
     /* ------------------------------------------------------- 已信任主机 */
 
     public synchronized String knownFingerprint(String hostKey) {

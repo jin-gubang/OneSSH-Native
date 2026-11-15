@@ -21,6 +21,7 @@ import android.widget.TextView;
 
 import com.onessh.app.data.Host;
 import com.onessh.app.data.Snippet;
+import com.onessh.app.data.SnippetGroup;
 import com.onessh.app.data.Store;
 import com.onessh.app.ssh.HostKeyPrompt;
 import com.onessh.app.ssh.MoshSession;
@@ -32,7 +33,10 @@ import com.onessh.app.ui.UI;
 import com.onessh.app.ui.Widgets;
 
 import java.nio.charset.StandardCharsets;
+import java.util.ArrayList;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 
 /** 终端页：连上之后这里就是一台真的终端。 */
 public class TerminalActivity extends Activity implements TerminalView.Listener {
@@ -543,6 +547,7 @@ public class TerminalActivity extends Activity implements TerminalView.Listener 
     private void snippetSheet() {
         if (term != null) term.clearCtrlLatch();
         List<Snippet> list = store.snippets();
+        List<SnippetGroup> groups = store.snippetGroups();
 
         final Dialog[] sheet = new Dialog[1];
         LinearLayout content = UI.column(this);
@@ -556,7 +561,32 @@ public class TerminalActivity extends Activity implements TerminalView.Listener 
             ScrollView sc = new ScrollView(this);
             sc.setVerticalScrollBarEnabled(false);
             LinearLayout rows = UI.column(this);
-            for (Snippet sn : list) rows.addView(snippetRow(sn, sheet));
+            // 按分组分段：先是各分组（按创建时间），最后是未分组
+            Map<String, List<Snippet>> byGroup = new LinkedHashMap<>();
+            List<Snippet> ungrouped = new ArrayList<>();
+            for (Snippet sn : list) {
+                if (sn.groupKey != null && !sn.groupKey.isEmpty()
+                        && store.snippetGroup(sn.groupKey) != null) {
+                    List<Snippet> g = byGroup.get(sn.groupKey);
+                    if (g == null) {
+                        g = new ArrayList<>();
+                        byGroup.put(sn.groupKey, g);
+                    }
+                    g.add(sn);
+                } else {
+                    ungrouped.add(sn);
+                }
+            }
+            for (SnippetGroup g : groups) {
+                List<Snippet> inGroup = byGroup.get(g.key);
+                if (inGroup == null || inGroup.isEmpty()) continue;
+                rows.addView(snippetGroupHeader(g.name, inGroup.size()));
+                for (Snippet sn : inGroup) rows.addView(snippetRow(sn, sheet));
+            }
+            if (!ungrouped.isEmpty()) {
+                rows.addView(snippetGroupHeader("未分组", ungrouped.size()));
+                for (Snippet sn : ungrouped) rows.addView(snippetRow(sn, sheet));
+            }
             sc.addView(rows);
             sc.setLayoutParams(new LinearLayout.LayoutParams(
                     ViewGroup.LayoutParams.MATCH_PARENT, UI.dp(320)));
@@ -578,6 +608,17 @@ public class TerminalActivity extends Activity implements TerminalView.Listener 
                 content, "关闭", null, false, (Runnable) null);
     }
 
+    private View snippetGroupHeader(String name, int count) {
+        TextView t = UI.text(this, name + "  ·  " + count + " 条", 12f, UI.MUTED);
+        t.setTypeface(UI.MEDIUM);
+        LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        lp.topMargin = UI.dp(8);
+        lp.bottomMargin = UI.dp(4);
+        t.setLayoutParams(lp);
+        return t;
+    }
+
     private View snippetRow(Snippet sn, Dialog[] sheet) {
         LinearLayout row = UI.row(this);
         row.setBackground(UI.ripple(UI.PAPER2, 10f));
@@ -594,6 +635,12 @@ public class TerminalActivity extends Activity implements TerminalView.Listener 
         cmd.setSingleLine(true);
         cmd.setEllipsize(android.text.TextUtils.TruncateAt.END);
         col.addView(cmd);
+        if (sn.note != null && !sn.note.isEmpty()) {
+            TextView note = UI.text(this, sn.note, 11f, UI.MUTED);
+            note.setSingleLine(true);
+            note.setEllipsize(android.text.TextUtils.TruncateAt.END);
+            col.addView(note);
+        }
         row.addView(col);
         UI.weight(col, 1f);
 
@@ -629,6 +676,13 @@ public class TerminalActivity extends Activity implements TerminalView.Listener 
 
     private void sendSnippet(Snippet sn) {
         if (term != null) term.scrollToBottom();
+        if (sn.onlyInput) {
+            // 仅输入：用括号粘贴模式一次填入，shell 只做字面插入、不执行，
+            // 多行命令也不会在中途逐行跑起来（bash/zsh 默认都支持）
+            write("\u001b[200~" + sn.command + "\u001b[201~");
+            UI.toast(this, "已输入（未执行）：" + sn.name);
+            return;
+        }
         for (String line : sn.command.split("\n")) {
             write(line + "\r");
         }
@@ -638,6 +692,7 @@ public class TerminalActivity extends Activity implements TerminalView.Listener 
     /** 新增 / 编辑片段的弹窗，保存后回到片段列表，改完马上就能发 */
     private void snippetEditor(Snippet snippet) {
         Snippet editing = snippet != null ? snippet : new Snippet();
+        final String[] groupKey = {editing.groupKey == null ? "" : editing.groupKey};
 
         LinearLayout form = UI.column(this);
         Widgets.Field nameField = Widgets.field(this, "名称", "例如：查看磁盘占用",
@@ -658,6 +713,37 @@ public class TerminalActivity extends Activity implements TerminalView.Listener 
         Widgets.top(cmdField.root, 12);
         form.addView(cmdField.root);
 
+        Widgets.Field noteField = Widgets.field(this, "备注（可选）", "例如：先装 speedtest-cli",
+                InputType.TYPE_CLASS_TEXT);
+        noteField.setText(editing.note == null ? "" : editing.note);
+        Widgets.top(noteField.root, 12);
+        form.addView(noteField.root);
+
+        // 分组行：点开选分组，选完直接改这行的值，不用重开编辑器
+        final TextView[] groupValue = new TextView[1];
+        LinearLayout groupRow = Widgets.pickRow(this, "folder",
+                "分组", groupName(groupKey[0]), null);
+        groupValue[0] = findValueText(groupRow);
+        groupRow.setOnClickListener(v -> pickSnippetGroup(groupKey, groupValue[0]));
+        Widgets.top(groupRow, 12);
+        form.addView(groupRow);
+
+        LinearLayout onlyRow = UI.row(this);
+        onlyRow.setGravity(Gravity.CENTER_VERTICAL);
+        Widgets.top(onlyRow, 14);
+        LinearLayout col = UI.column(this);
+        col.addView(UI.medium(this, "仅输入，不执行", 13.5f, UI.INK));
+        TextView onlyHint = UI.text(this, "只把命令填到输入框，不按回车，适合要改几个参数再跑的命令。",
+                11.5f, UI.MUTED);
+        onlyHint.setLineSpacing(UI.dp(3), 1f);
+        Widgets.top(onlyHint, 3);
+        col.addView(onlyHint);
+        onlyRow.addView(col);
+        UI.weight(col, 1f);
+        final Widgets.Toggle onlyInputToggle = new Widgets.Toggle(this, editing.onlyInput);
+        onlyRow.addView(onlyInputToggle);
+        form.addView(onlyRow);
+
         Dialogs.custom(this,
                 snippet == null || snippet.id == null || snippet.id.isEmpty()
                         ? "新增片段" : "编辑片段",
@@ -675,10 +761,82 @@ public class TerminalActivity extends Activity implements TerminalView.Listener 
                     }
                     editing.name = name;
                     editing.command = command;
+                    editing.groupKey = groupKey[0];
+                    editing.note = noteField.text().trim();
+                    editing.onlyInput = onlyInputToggle.isChecked();
                     store.saveSnippet(editing);
                     UI.toast(this, "已保存");
                     snippetSheet();
                     return true;
+                });
+    }
+
+    /** pickRow 里放值的那个 TextView（列里最后一个 TextView，前面是小字 label） */
+    private TextView findValueText(LinearLayout row) {
+        for (int i = 0; i < row.getChildCount(); i++) {
+            View child = row.getChildAt(i);
+            if (child instanceof LinearLayout) {
+                LinearLayout col = (LinearLayout) child;
+                TextView found = null;
+                for (int j = 0; j < col.getChildCount(); j++) {
+                    if (col.getChildAt(j) instanceof TextView) {
+                        found = (TextView) col.getChildAt(j);
+                    }
+                }
+                if (found != null) return found;
+            }
+        }
+        return null;
+    }
+
+    private String groupName(String key) {
+        if (key == null || key.isEmpty()) return "未分组";
+        SnippetGroup g = store.snippetGroup(key);
+        return g == null ? "未分组" : g.name;
+    }
+
+    /** 选分组：未分组 / 已有分组 / 新建分组，选完直接改行上的值 */
+    private void pickSnippetGroup(final String[] groupKey, final TextView valueView) {
+        List<SnippetGroup> groups = store.snippetGroups();
+        List<String> labels = new ArrayList<>();
+        List<String> subs = new ArrayList<>();
+        labels.add("未分组");
+        subs.add("不放在任何分组里");
+        int selected = 0;
+        for (int i = 0; i < groups.size(); i++) {
+            SnippetGroup g = groups.get(i);
+            labels.add(g.name);
+            int n = 0;
+            for (Snippet s : store.snippets()) if (g.key.equals(s.groupKey)) n++;
+            subs.add(n + " 条片段");
+            if (g.key.equals(groupKey[0])) selected = i + 1;
+        }
+        labels.add("＋ 新建分组…");
+        subs.add(null);
+        Dialogs.choose(this, "选择分组",
+                labels.toArray(new String[0]), subs.toArray(new String[0]),
+                selected, idx -> {
+                    if (idx == labels.size() - 1) {
+                        Dialogs.prompt(this, "新建分组", "分组名称", "例如：网络",
+                                "", false, text -> {
+                                    String n = text == null ? "" : text.trim();
+                                    if (n.isEmpty()) {
+                                        UI.toast(this, "分组名称不能为空");
+                                        return;
+                                    }
+                                    SnippetGroup g = new SnippetGroup();
+                                    g.name = n;
+                                    store.saveSnippetGroup(g);
+                                    groupKey[0] = g.key;
+                                    if (valueView != null) valueView.setText(g.name);
+                                });
+                    } else if (idx == 0) {
+                        groupKey[0] = "";
+                        if (valueView != null) valueView.setText("未分组");
+                    } else {
+                        groupKey[0] = groups.get(idx - 1).key;
+                        if (valueView != null) valueView.setText(groups.get(idx - 1).name);
+                    }
                 });
     }
 
