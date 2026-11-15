@@ -1,10 +1,13 @@
 name: Android CI
 
 # 推到 GitHub 后无需任何配置即可编译：
-# - push 到 main / master、推送 v* 标签、手动运行：编译并自动创建/更新 GitHub Release
-# - PR：只编译并上传 Artifact，不发布 Release
-# 版本号唯一来源：app/build.gradle.kts 的 versionCode / versionName。
-# 每次构建自动读取，产物名与 Release 附件都会带上该版本号。
+# - push 到 main / master、手动运行：编译 → 版本号 +1 → 自动提交并推送回去 → 发布 Release
+# - 推送 v* 标签：用标签对应的版本号编译并发布，不再递增
+# - PR：只编译并上传 Artifact，不递增、不发布
+#
+# 版本号唯一来源：根目录 version.properties。
+# 递增由 Gradle 自己做（app/build.gradle.kts），CI 只负责把改完的文件 commit + push，
+# 因此本地 ./gradlew assembleDebug 与 CI 用的是同一套规则。
 on:
   push:
     branches: [main, master]
@@ -19,7 +22,7 @@ concurrency:
   # 避免连续操作时把正在跑的运行取消（表现为 "The operation was canceled."）
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
-# 常规构建最小权限；只有发版 job 单独提权到 contents: write
+# 常规构建最小权限；build job 要回推版本号，单独提权到 contents: write
 permissions:
   contents: read
 
@@ -28,11 +31,17 @@ jobs:
     name: 编译 APK
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    permissions:
+      contents: write
     outputs:
       version: ${{ steps.version.outputs.name }}
+      code: ${{ steps.version.outputs.code }}
     steps:
       - name: 检出代码
         uses: actions/checkout@v4
+        with:
+          # 回推版本号要能 rebase，浅克隆不够用
+          fetch-depth: 0
 
       - name: 准备 JDK 21
         uses: actions/setup-java@v4
@@ -51,7 +60,7 @@ jobs:
       # 直接报 "Failed to find package 'tools'" 并退出 1。
       # ubuntu-latest 自带 Android SDK，定位预装的 sdkmanager 即可。
       - name: 定位 Android SDK 与 sdkmanager
-        run: |
+        run: |-
           export ANDROID_HOME="${ANDROID_HOME:-/usr/local/lib/android/sdk}"
           SDKMGR=$(command -v sdkmanager || true)
           if [ -z "$SDKMGR" ] && [ -x "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" ]; then
@@ -73,7 +82,7 @@ jobs:
           echo "SDKMGR=$SDKMGR" >> "$GITHUB_ENV"
 
       - name: 接受许可并安装 compileSdk 36 / build-tools 36.0.0
-        run: |
+        run: |-
           yes 2>/dev/null | "$SDKMGR" --sdk_root="$ANDROID_HOME" --licenses > /dev/null 2>&1 || true
           "$SDKMGR" --sdk_root="$ANDROID_HOME" --install \
             "platform-tools" "platforms;android-36" "build-tools;36.0.0"
@@ -85,49 +94,93 @@ jobs:
         run: chmod +x gradlew
 
       - name: 固定 debug 签名
-        run: |
+        run: |-
           # runner 每次全新，AGP 默认会现生成 debug.keystore，导致每次签名不同、
           # 手机上无法覆盖安装。用仓库内固定的调试密钥覆盖默认路径。
           mkdir -p "$HOME/.android"
           base64 -d app/debug.keystore.base64 > "$HOME/.android/debug.keystore"
 
       - name: 打印构建环境
-        run: |
+        run: |-
           java -version
           ./gradlew --version
 
-      - name: 读取版本号
+      # 构建这一刻，Gradle 会把 version.properties 的 patch / build 各 +1。
+      # PR 与标签构建不需要新版本号，用 -PnoBump 锁住。
+      - name: 编译 Debug / Release（自动递增版本号）
+        env:
+          NO_BUMP_REF: ${{ github.ref_type == 'tag' || github.event_name == 'pull_request' }}
+        run: |-
+          BUMP_FLAG=""
+          if [ "$NO_BUMP_REF" = "true" ]; then
+            BUMP_FLAG="-PnoBump"
+            echo "本次构建不递增版本号（PR 或标签构建）"
+          fi
+          ./gradlew assembleDebug assembleRelease --no-daemon --stacktrace $BUMP_FLAG
+
+      - name: 读取构建出的版本号
         id: version
-        run: |
-          V=$(sed -n 's/.*versionName = "\([^"]*\)".*/\1/p' app/build.gradle.kts | head -1)
-          C=$(sed -n 's/.*versionCode = \([0-9]*\).*/\1/p' app/build.gradle.kts | head -1)
-          if [ -z "$V" ] || [ -z "$C" ]; then
-            echo "::error::未能从 app/build.gradle.kts 读取 versionName / versionCode"
+        run: |-
+          get() { sed -n "s/^$1=//p" version.properties | head -1 | tr -d '[:space:]'; }
+          MA=$(get major); MI=$(get minor); PA=$(get patch); BU=$(get build)
+          if [ -z "$MA" ] || [ -z "$MI" ] || [ -z "$PA" ]; then
+            echo "::error::未能从 version.properties 读取版本号"
+            cat version.properties
             exit 1
           fi
-          echo "name=$V" >> "$GITHUB_OUTPUT"
-          echo "code=$C" >> "$GITHUB_OUTPUT"
-          echo "版本：$V (versionCode $C)"
+          NAME="$MA.$MI.$PA"
+          CODE=$(( MA * 1000000 + MI * 10000 + PA ))
+          {
+            echo "name=$NAME"
+            echo "code=$CODE"
+            echo "major=$MA"
+            echo "minor=$MI"
+            echo "patch=$PA"
+            echo "build=$BU"
+          } >> "$GITHUB_OUTPUT"
+          echo "版本：$NAME (versionCode $CODE，第 $BU 次构建)"
 
       - name: 校验标签与版本号一致
         if: startsWith(github.ref, 'refs/tags/')
-        run: |
+        run: |-
           TAG="${GITHUB_REF_NAME#v}"
           V="${{ steps.version.outputs.name }}"
           if [ "$TAG" != "$V" ]; then
-            echo "::warning::标签 v$TAG 与 app/build.gradle.kts 的 versionName $V 不一致，请核对"
+            echo "::warning::标签 v$TAG 与 version.properties 的 versionName $V 不一致，请核对"
           fi
 
-      - name: 编译 Debug / Release
-        run: ./gradlew assembleDebug assembleRelease --no-daemon --stacktrace
+      # 把递增后的版本号推回仓库，代码里的版本永远是「最新已构建」的那个。
+      # 用 GITHUB_TOKEN 推送不会再次触发 workflow，所以不存在构建死循环；
+      # 提交信息里仍带 [skip ci] 作为双保险。
+      - name: 回推新版本号
+        if: github.event_name != 'pull_request' && github.ref_type == 'branch'
+        run: |-
+          if git diff --quiet -- version.properties; then
+            echo "version.properties 无变化，跳过"
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add version.properties
+          git commit -m "chore(release): v${{ steps.version.outputs.name }} [skip ci]"
+          for i in 1 2 3; do
+            if git pull --rebase --autostash origin "$GITHUB_REF_NAME" \
+               && git push origin "HEAD:$GITHUB_REF_NAME"; then
+              echo "已推送 v${{ steps.version.outputs.name }} 到 $GITHUB_REF_NAME"
+              exit 0
+            fi
+            echo "第 $i 次推送失败，5 秒后重试"
+            sleep 5
+          done
+          echo "::warning::版本号回推失败（分支可能受保护）；本次 APK 仍可用，下次构建会继续递增"
 
       - name: 校验 debug 签名指纹
-        run: |
+        run: |-
           "$ANDROID_HOME/build-tools/36.0.0/apksigner" verify --print-certs \
             app/build/outputs/apk/debug/app-debug.apk | grep -i "SHA-256"
 
       - name: 归档带版本号的 APK
-        run: |
+        run: |-
           V="${{ steps.version.outputs.name }}"
           mkdir -p dist
           cp app/build/outputs/apk/debug/app-debug.apk "dist/OneSSH-${V}-debug.apk"
@@ -169,8 +222,13 @@ jobs:
       - name: 创建 GitHub Release
         uses: softprops/action-gh-release@v2
         with:
+          # 每次构建的版本号都是新的，所以每次都会新建一个 tag + Release
           tag_name: ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || format('v{0}', needs.build.outputs.version) }}
           name: OneSSH ${{ needs.build.outputs.version }}
+          body: |-
+            OneSSH ${{ needs.build.outputs.version }} · versionCode ${{ needs.build.outputs.code }}
+
+            由 `${{ github.sha }}` 自动构建。安装 `*-debug.apk` 可直接覆盖升级（签名固定）。
           generate_release_notes: true
-          files: |
+          files: |-
             artifacts/**/*.apk
