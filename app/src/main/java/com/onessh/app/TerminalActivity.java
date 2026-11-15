@@ -21,8 +21,10 @@ import android.widget.TextView;
 
 import com.onessh.app.data.Host;
 import com.onessh.app.data.Snippet;
+import com.onessh.app.data.SnippetGroup;
 import com.onessh.app.data.Store;
 import com.onessh.app.ssh.HostKeyPrompt;
+import com.onessh.app.ssh.MoshSession;
 import com.onessh.app.ssh.SshSession;
 import com.onessh.app.term.TermColors;
 import com.onessh.app.term.TerminalView;
@@ -31,7 +33,10 @@ import com.onessh.app.ui.UI;
 import com.onessh.app.ui.Widgets;
 
 import java.nio.charset.StandardCharsets;
+import java.util.ArrayList;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 
 /** 终端页：连上之后这里就是一台真的终端。 */
 public class TerminalActivity extends Activity implements TerminalView.Listener {
@@ -48,9 +53,11 @@ public class TerminalActivity extends Activity implements TerminalView.Listener 
     private Host host;
     private String hostId;
     private SshSession session;
+    private MoshSession moshSession;
 
     private TerminalView term;
     private LinearLayout overlay;
+    private LinearLayout selectionBar;
     private LinearLayout keysBar;
     private TextView ctrlKey;
     private TextView titleText;
@@ -106,6 +113,17 @@ public class TerminalActivity extends Activity implements TerminalView.Listener 
         overlay.setBackgroundColor(0xF2070910);
         termWrap.addView(overlay, new FrameLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
+
+        // 文字选中的操作栏：平时藏着，进选中模式才贴在终端底部
+        selectionBar = buildSelectionBar();
+        FrameLayout.LayoutParams slp = new FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        slp.gravity = Gravity.BOTTOM;
+        slp.leftMargin = UI.dp(12);
+        slp.rightMargin = UI.dp(12);
+        slp.bottomMargin = UI.dp(10);
+        termWrap.addView(selectionBar, slp);
+        selectionBar.setVisibility(View.GONE);
 
         keysBar = buildKeys();
         content.addView(keysBar);
@@ -176,7 +194,7 @@ public class TerminalActivity extends Activity implements TerminalView.Listener 
         bar.setPadding(UI.dp(4), UI.dp(6), UI.dp(4), UI.dp(6));
 
         View back = Widgets.barIcon(this, "back", UI.TERM_FG, () -> {
-            if (session != null && session.isConnected()) askDisconnect();
+            if (anyConnected()) askDisconnect();
             else finish();
         });
         bar.addView(back);
@@ -362,6 +380,9 @@ public class TerminalActivity extends Activity implements TerminalView.Listener 
 
     private void connect() {
         if (session != null) session.close();
+        if (moshSession != null) moshSession.close();
+        session = null;
+        moshSession = null;
         showOverlay("connecting", getString(R.string.connecting), null);
         setStatus("connecting", getString(R.string.connecting));
 
@@ -371,7 +392,8 @@ public class TerminalActivity extends Activity implements TerminalView.Listener 
             return;
         }
 
-        session = new SshSession(cfg, new SshSession.Listener() {
+        // SSH 和 Mosh 共用同一套输出/状态回调，终端侧不用区分走哪条路
+        SshSession.Listener listener = new SshSession.Listener() {
             @Override
             public void onOutput(byte[] data) {
                 if (term != null) term.feed(data);
@@ -381,7 +403,17 @@ public class TerminalActivity extends Activity implements TerminalView.Listener 
             public void onState(String state, String message) {
                 runOnUiThread(() -> handleState(state, message));
             }
-        }, this::verifyHostKey);
+        };
+
+        if (host != null && host.mosh) {
+            moshSession = new MoshSession(this, cfg, listener, this::verifyHostKey);
+            Thread t = new Thread(moshSession::connect, "mosh-connect");
+            t.setDaemon(true);
+            t.start();
+            return;
+        }
+
+        session = new SshSession(cfg, listener, this::verifyHostKey);
 
         Thread t = new Thread(session::connect, "ssh-connect");
         t.setDaemon(true);
@@ -393,7 +425,9 @@ public class TerminalActivity extends Activity implements TerminalView.Listener 
         switch (state) {
             case "connected":
                 hideOverlay();
-                setStatus("connected", getString(R.string.connected));
+                setStatus("connected", moshSession != null
+                        ? getString(R.string.connected) + " · Mosh"
+                        : getString(R.string.connected));
                 if (host != null) store.touchHost(host.id);
                 break;
             case "closed":
@@ -424,20 +458,28 @@ public class TerminalActivity extends Activity implements TerminalView.Listener 
 
     @Override
     public void onInput(byte[] data) {
-        SshSession s = session;
-        if (s != null) s.write(data);
+        if (moshSession != null) moshSession.write(data);
+        else if (session != null) session.write(data);
     }
 
     @Override
     public void onResize(int cols, int rows) {
-        SshSession s = session;
-        if (s != null) s.resize(cols, rows);
+        if (moshSession != null) moshSession.resize(cols, rows);
+        else if (session != null) session.resize(cols, rows);
     }
 
     private void write(String s) {
-        SshSession sess = session;
-        if (sess == null) return;
-        sess.write(s.getBytes(StandardCharsets.UTF_8));
+        if (moshSession != null) {
+            moshSession.write(s.getBytes(StandardCharsets.UTF_8));
+        } else if (session != null) {
+            session.write(s.getBytes(StandardCharsets.UTF_8));
+        }
+    }
+
+    /** SSH 或 Mosh 任一会话连着就算连上 */
+    private boolean anyConnected() {
+        return (session != null && session.isConnected())
+                || (moshSession != null && moshSession.isConnected());
     }
 
     private void moreMenu() {
@@ -475,7 +517,7 @@ public class TerminalActivity extends Activity implements TerminalView.Listener 
      * 只有连上之后才能最小化；还没连上时点了也没意义。
      */
     private void minimize() {
-        if (session == null || !session.isConnected()) {
+        if (!anyConnected()) {
             UI.toast(this, "还没连上，等连接成功再最小化");
             return;
         }
@@ -517,6 +559,7 @@ public class TerminalActivity extends Activity implements TerminalView.Listener 
     private void snippetSheet() {
         if (term != null) term.clearCtrlLatch();
         List<Snippet> list = store.snippets();
+        List<SnippetGroup> groups = store.snippetGroups();
 
         final Dialog[] sheet = new Dialog[1];
         LinearLayout content = UI.column(this);
@@ -530,7 +573,32 @@ public class TerminalActivity extends Activity implements TerminalView.Listener 
             ScrollView sc = new ScrollView(this);
             sc.setVerticalScrollBarEnabled(false);
             LinearLayout rows = UI.column(this);
-            for (Snippet sn : list) rows.addView(snippetRow(sn, sheet));
+            // 按分组分段：先是各分组（按创建时间），最后是未分组
+            Map<String, List<Snippet>> byGroup = new LinkedHashMap<>();
+            List<Snippet> ungrouped = new ArrayList<>();
+            for (Snippet sn : list) {
+                if (sn.groupKey != null && !sn.groupKey.isEmpty()
+                        && store.snippetGroup(sn.groupKey) != null) {
+                    List<Snippet> g = byGroup.get(sn.groupKey);
+                    if (g == null) {
+                        g = new ArrayList<>();
+                        byGroup.put(sn.groupKey, g);
+                    }
+                    g.add(sn);
+                } else {
+                    ungrouped.add(sn);
+                }
+            }
+            for (SnippetGroup g : groups) {
+                List<Snippet> inGroup = byGroup.get(g.key);
+                if (inGroup == null || inGroup.isEmpty()) continue;
+                rows.addView(snippetGroupHeader(g.name, inGroup.size()));
+                for (Snippet sn : inGroup) rows.addView(snippetRow(sn, sheet));
+            }
+            if (!ungrouped.isEmpty()) {
+                rows.addView(snippetGroupHeader("未分组", ungrouped.size()));
+                for (Snippet sn : ungrouped) rows.addView(snippetRow(sn, sheet));
+            }
             sc.addView(rows);
             sc.setLayoutParams(new LinearLayout.LayoutParams(
                     ViewGroup.LayoutParams.MATCH_PARENT, UI.dp(320)));
@@ -552,6 +620,17 @@ public class TerminalActivity extends Activity implements TerminalView.Listener 
                 content, "关闭", null, false, (Runnable) null);
     }
 
+    private View snippetGroupHeader(String name, int count) {
+        TextView t = UI.text(this, name + "  ·  " + count + " 条", 12f, UI.MUTED);
+        t.setTypeface(UI.MEDIUM);
+        LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        lp.topMargin = UI.dp(8);
+        lp.bottomMargin = UI.dp(4);
+        t.setLayoutParams(lp);
+        return t;
+    }
+
     private View snippetRow(Snippet sn, Dialog[] sheet) {
         LinearLayout row = UI.row(this);
         row.setBackground(UI.ripple(UI.PAPER2, 10f));
@@ -568,6 +647,12 @@ public class TerminalActivity extends Activity implements TerminalView.Listener 
         cmd.setSingleLine(true);
         cmd.setEllipsize(android.text.TextUtils.TruncateAt.END);
         col.addView(cmd);
+        if (sn.note != null && !sn.note.isEmpty()) {
+            TextView note = UI.text(this, sn.note, 11f, UI.MUTED);
+            note.setSingleLine(true);
+            note.setEllipsize(android.text.TextUtils.TruncateAt.END);
+            col.addView(note);
+        }
         row.addView(col);
         UI.weight(col, 1f);
 
@@ -603,6 +688,13 @@ public class TerminalActivity extends Activity implements TerminalView.Listener 
 
     private void sendSnippet(Snippet sn) {
         if (term != null) term.scrollToBottom();
+        if (sn.onlyInput) {
+            // 仅输入：用括号粘贴模式一次填入，shell 只做字面插入、不执行，
+            // 多行命令也不会在中途逐行跑起来（bash/zsh 默认都支持）
+            write("\u001b[200~" + sn.command + "\u001b[201~");
+            UI.toast(this, "已输入（未执行）：" + sn.name);
+            return;
+        }
         for (String line : sn.command.split("\n")) {
             write(line + "\r");
         }
@@ -612,6 +704,7 @@ public class TerminalActivity extends Activity implements TerminalView.Listener 
     /** 新增 / 编辑片段的弹窗，保存后回到片段列表，改完马上就能发 */
     private void snippetEditor(Snippet snippet) {
         Snippet editing = snippet != null ? snippet : new Snippet();
+        final String[] groupKey = {editing.groupKey == null ? "" : editing.groupKey};
 
         LinearLayout form = UI.column(this);
         Widgets.Field nameField = Widgets.field(this, "名称", "例如：查看磁盘占用",
@@ -632,6 +725,37 @@ public class TerminalActivity extends Activity implements TerminalView.Listener 
         Widgets.top(cmdField.root, 12);
         form.addView(cmdField.root);
 
+        Widgets.Field noteField = Widgets.field(this, "备注（可选）", "例如：先装 speedtest-cli",
+                InputType.TYPE_CLASS_TEXT);
+        noteField.setText(editing.note == null ? "" : editing.note);
+        Widgets.top(noteField.root, 12);
+        form.addView(noteField.root);
+
+        // 分组行：点开选分组，选完直接改这行的值，不用重开编辑器
+        final TextView[] groupValue = new TextView[1];
+        LinearLayout groupRow = Widgets.pickRow(this, "folder",
+                "分组", groupName(groupKey[0]), null);
+        groupValue[0] = findValueText(groupRow);
+        groupRow.setOnClickListener(v -> pickSnippetGroup(groupKey, groupValue[0]));
+        Widgets.top(groupRow, 12);
+        form.addView(groupRow);
+
+        LinearLayout onlyRow = UI.row(this);
+        onlyRow.setGravity(Gravity.CENTER_VERTICAL);
+        Widgets.top(onlyRow, 14);
+        LinearLayout col = UI.column(this);
+        col.addView(UI.medium(this, "仅输入，不执行", 13.5f, UI.INK));
+        TextView onlyHint = UI.text(this, "只把命令填到输入框，不按回车，适合要改几个参数再跑的命令。",
+                11.5f, UI.MUTED);
+        onlyHint.setLineSpacing(UI.dp(3), 1f);
+        Widgets.top(onlyHint, 3);
+        col.addView(onlyHint);
+        onlyRow.addView(col);
+        UI.weight(col, 1f);
+        final Widgets.Toggle onlyInputToggle = new Widgets.Toggle(this, editing.onlyInput);
+        onlyRow.addView(onlyInputToggle);
+        form.addView(onlyRow);
+
         Dialogs.custom(this,
                 snippet == null || snippet.id == null || snippet.id.isEmpty()
                         ? "新增片段" : "编辑片段",
@@ -649,10 +773,82 @@ public class TerminalActivity extends Activity implements TerminalView.Listener 
                     }
                     editing.name = name;
                     editing.command = command;
+                    editing.groupKey = groupKey[0];
+                    editing.note = noteField.text().trim();
+                    editing.onlyInput = onlyInputToggle.isChecked();
                     store.saveSnippet(editing);
                     UI.toast(this, "已保存");
                     snippetSheet();
                     return true;
+                });
+    }
+
+    /** pickRow 里放值的那个 TextView（列里最后一个 TextView，前面是小字 label） */
+    private TextView findValueText(LinearLayout row) {
+        for (int i = 0; i < row.getChildCount(); i++) {
+            View child = row.getChildAt(i);
+            if (child instanceof LinearLayout) {
+                LinearLayout col = (LinearLayout) child;
+                TextView found = null;
+                for (int j = 0; j < col.getChildCount(); j++) {
+                    if (col.getChildAt(j) instanceof TextView) {
+                        found = (TextView) col.getChildAt(j);
+                    }
+                }
+                if (found != null) return found;
+            }
+        }
+        return null;
+    }
+
+    private String groupName(String key) {
+        if (key == null || key.isEmpty()) return "未分组";
+        SnippetGroup g = store.snippetGroup(key);
+        return g == null ? "未分组" : g.name;
+    }
+
+    /** 选分组：未分组 / 已有分组 / 新建分组，选完直接改行上的值 */
+    private void pickSnippetGroup(final String[] groupKey, final TextView valueView) {
+        List<SnippetGroup> groups = store.snippetGroups();
+        List<String> labels = new ArrayList<>();
+        List<String> subs = new ArrayList<>();
+        labels.add("未分组");
+        subs.add("不放在任何分组里");
+        int selected = 0;
+        for (int i = 0; i < groups.size(); i++) {
+            SnippetGroup g = groups.get(i);
+            labels.add(g.name);
+            int n = 0;
+            for (Snippet s : store.snippets()) if (g.key.equals(s.groupKey)) n++;
+            subs.add(n + " 条片段");
+            if (g.key.equals(groupKey[0])) selected = i + 1;
+        }
+        labels.add("＋ 新建分组…");
+        subs.add(null);
+        Dialogs.choose(this, "选择分组",
+                labels.toArray(new String[0]), subs.toArray(new String[0]),
+                selected, idx -> {
+                    if (idx == labels.size() - 1) {
+                        Dialogs.prompt(this, "新建分组", "分组名称", "例如：网络",
+                                "", false, text -> {
+                                    String n = text == null ? "" : text.trim();
+                                    if (n.isEmpty()) {
+                                        UI.toast(this, "分组名称不能为空");
+                                        return;
+                                    }
+                                    SnippetGroup g = new SnippetGroup();
+                                    g.name = n;
+                                    store.saveSnippetGroup(g);
+                                    groupKey[0] = g.key;
+                                    if (valueView != null) valueView.setText(g.name);
+                                });
+                    } else if (idx == 0) {
+                        groupKey[0] = "";
+                        if (valueView != null) valueView.setText("未分组");
+                    } else {
+                        groupKey[0] = groups.get(idx - 1).key;
+                        if (valueView != null) valueView.setText(groups.get(idx - 1).name);
+                    }
                 });
     }
 
@@ -663,26 +859,34 @@ public class TerminalActivity extends Activity implements TerminalView.Listener 
         snippetEditor(fresh);
     }
 
-    /** 长按终端：高亮按住的那一行，弹菜单让用户复制该行、复制全部输出，或把它存成片段 */
+    /** 长按终端：高亮按住的那一行，弹菜单让用户复制该行、拖选文字、复制全部输出，或把它存成片段 */
     @Override
-    public void onLongPress(float y) {
+    public void onLongPress(float x, float y) {
         if (term == null) return;
         String line = term.lineTextAt(y);
         if (line == null || line.trim().isEmpty()) {
-            term.clearSelection();
-            UI.toast(this, "这一行是空的");
+            // 空行上长按：只能从这里开始拖选文字
+            Dialogs.sheet(this, "这一行是空的",
+                    new String[]{"复制文字"},
+                    new String[]{"copy"}, -1, idx -> {
+                        term.clearSelection();
+                        term.startTextSelection(x, y);
+                    });
             return;
         }
         String preview = line.length() > 40 ? line.substring(0, 40) + "…" : line;
         Dialogs.sheet(this, preview,
-                new String[]{"复制该行", "复制全部输出", "加片段"},
-                new String[]{"copy", "copy", "plus"}, -1, idx -> {
+                new String[]{"复制该行", "复制文字", "复制全部输出", "加片段"},
+                new String[]{"copy", "copy", "copy", "plus"}, -1, idx -> {
                     term.clearSelection();
                     switch (idx) {
                         case 0:
                             copyText(line, "已复制该行");
                             break;
                         case 1:
+                            term.startTextSelection(x, y);
+                            break;
+                        case 2:
                             copyAll();
                             break;
                         default:
@@ -690,6 +894,49 @@ public class TerminalActivity extends Activity implements TerminalView.Listener 
                             break;
                     }
                 });
+    }
+
+    /** 文字选中模式的开关：进模式显示底部复制栏，退出就收起来 */
+    @Override
+    public void onTextSelection(boolean active) {
+        if (selectionBar != null) {
+            selectionBar.setVisibility(active ? View.VISIBLE : View.GONE);
+        }
+    }
+
+    private LinearLayout buildSelectionBar() {
+        LinearLayout bar = UI.row(this);
+        bar.setGravity(Gravity.CENTER_VERTICAL);
+        bar.setBackground(UI.bg(UI.CARD, 12f, UI.LINE, 1f));
+        bar.setElevation(UI.dp(4f));
+        UI.padding(bar, 12, 10, 12, 10);
+
+        TextView hint = UI.text(this, "拖动两端圆点调整选区", 12f, UI.MUTED);
+        bar.addView(hint);
+        UI.weight(hint, 1f);
+
+        LinearLayout copy = Widgets.button(this, "复制", "copy", true);
+        copy.setOnClickListener(v -> copySelection());
+        bar.addView(copy);
+
+        LinearLayout cancel = Widgets.button(this, "取消", null, false);
+        Widgets.margins(cancel, 8, 0, 0, 0);
+        cancel.setOnClickListener(v -> {
+            if (term != null) term.clearTextSelection();
+        });
+        bar.addView(cancel);
+        return bar;
+    }
+
+    private void copySelection() {
+        if (term == null) return;
+        String text = term.selectedText();
+        if (text == null || text.isEmpty()) {
+            UI.toast(this, "选中的内容是空的");
+            return;
+        }
+        copyText(text, "已复制");
+        term.clearTextSelection();
     }
 
     private void copyText(String text, String toast) {
@@ -712,9 +959,11 @@ public class TerminalActivity extends Activity implements TerminalView.Listener 
             term.setFontSizeSp(sizes[idx]);
             store.setFontSize(sizes[idx]);
             term.post(() -> {
-                if (session != null && term.buffer() != null) {
-                    session.resize(term.buffer().cols, term.buffer().rows);
-                }
+                if (term.buffer() == null) return;
+                int cols = term.buffer().cols;
+                int rows = term.buffer().rows;
+                if (moshSession != null) moshSession.resize(cols, rows);
+                else if (session != null) session.resize(cols, rows);
             });
         });
     }
@@ -733,13 +982,14 @@ public class TerminalActivity extends Activity implements TerminalView.Listener 
         Dialogs.confirm(this, "断开连接", "当前会话会立即结束，远端正在跑的任务可能被中断。",
                 "断开", true, () -> {
                     if (session != null) session.close();
+                    if (moshSession != null) moshSession.close();
                     finish();
                 });
     }
 
     @Override
     public void onBackPressed() {
-        if (session != null && session.isConnected()) askDisconnect();
+        if (anyConnected()) askDisconnect();
         else super.onBackPressed();
     }
 
@@ -749,6 +999,7 @@ public class TerminalActivity extends Activity implements TerminalView.Listener 
         // 登记也要清掉，主机列表上的悬浮卡片才不会变成死按钮。
         SessionRegistry.clearIf(this);
         if (session != null) session.close();
+        if (moshSession != null) moshSession.close();
         super.onDestroy();
     }
 
@@ -756,6 +1007,8 @@ public class TerminalActivity extends Activity implements TerminalView.Listener 
 
     private void showOverlay(String state, String title, String detail) {
         if (overlay == null) return;
+        // 连接状态变了，正在选的文字就作废，复制栏也收起来
+        if (term != null) term.clearTextSelection();
         overlay.removeAllViews();
         overlay.setVisibility(View.VISIBLE);
 

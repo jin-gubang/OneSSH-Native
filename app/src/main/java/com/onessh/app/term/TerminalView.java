@@ -41,8 +41,12 @@ public class TerminalView extends View {
         default void onCtrlLatch(boolean on) {
         }
 
-        /** 长按终端：y 是按下时的触摸纵坐标，Activity 据此取行并弹复制菜单 */
-        default void onLongPress(float y) {
+        /** 长按终端：x、y 是按下时的触摸坐标，Activity 据此取行并弹复制菜单 */
+        default void onLongPress(float x, float y) {
+        }
+
+        /** 拖动手柄的文字选中模式开 / 关，Activity 据此显示或收起复制栏 */
+        default void onTextSelection(boolean active) {
         }
     }
 
@@ -74,6 +78,15 @@ public class TerminalView extends View {
     private boolean longPressed;
     /** 正在高亮的行（回滚区 + 当前屏的统一行号），-1 表示没有 */
     private int selIndex = -1;
+
+    /* 拖动手柄的文字选中：起止都是（统一行号，列），闭区间 */
+    private boolean selecting;
+    private int selStartIndex = -1;
+    private int selStartCol;
+    private int selEndIndex = -1;
+    private int selEndCol;
+    /** 正在拖的手柄：0 没有，1 起点，2 终点 */
+    private int dragHandle;
 
     private boolean cursorOn = true;
     private boolean attached;
@@ -192,10 +205,68 @@ public class TerminalView extends View {
         int cols = Math.max(2, (int) Math.floor(getWidth() / cellW));
         int rows = Math.max(2, (int) Math.floor(getHeight() / cellH));
         if (cols == buffer.cols && rows == buffer.rows) return;
+        // 格子变了，旧的选中位置就对不上了，直接退出选中模式
+        if (selecting) clearTextSelection();
         buffer.resize(cols, rows);
         scrollPx = 0;
         if (listener != null) listener.onResize(cols, rows);
         invalidate();
+    }
+
+    /* ------------------------------------------------------- 文字选中 */
+
+    /** 选中这一行里某一段的背景（起止都是闭区间），画在文字下面 */
+    private void drawSelectionRow(Canvas canvas, int index, float top) {
+        if (index < selStartIndex || index > selEndIndex) return;
+        int from = index == selStartIndex ? selStartCol : 0;
+        int to = index == selEndIndex ? selEndCol : buffer.cols - 1;
+        if (from > to) return;
+        fillPaint.setColor(TermColors.SELECTION);
+        canvas.drawRect(from * cellW, top, (to + 1) * cellW, top + cellH, fillPaint);
+    }
+
+    /** 起点手柄在选中区左上角往上、终点手柄在右下角往下：圆点 + 一根短柄 */
+    private void drawHandles(Canvas canvas, int topIndex) {
+        float density = getResources().getDisplayMetrics().density;
+        float r = 7f * density;
+        float stemW = Math.max(2f, 2f * density);
+        decoPaint.setStyle(Paint.Style.FILL);
+        decoPaint.setColor(TermColors.CURSOR);
+        drawHandle(canvas, handlePos(selStartIndex, selStartCol, true, topIndex), r, stemW);
+        drawHandle(canvas, handlePos(selEndIndex, selEndCol, false, topIndex), r, stemW);
+    }
+
+    /**
+     * 手柄位置：{圆心 x, 圆心 y, 锚点 x, 锚点 y}。
+     * 起点手柄的锚点是选中区左上角、圆点在它往上；
+     * 终点手柄的锚点是右下角、圆点在它往下。行不在屏内返回 null。
+     */
+    private float[] handlePos(int index, int col, boolean start, int topIndex) {
+        int row = index - topIndex;
+        if (row < 0 || row >= buffer.rows) return null;
+        float density = getResources().getDisplayMetrics().density;
+        float r = 7f * density;
+        float gap = 2f * density;
+        if (start) {
+            float ax = col * cellW;
+            float ay = row * cellH;
+            return new float[]{ax, ay - r - gap, ax, ay};
+        }
+        float ax = (col + 1) * cellW;
+        float ay = (row + 1) * cellH;
+        return new float[]{ax, ay + r + gap, ax, ay};
+    }
+
+    /** 短柄从圆点边缘连到选区的角，再画圆点 */
+    private void drawHandle(Canvas canvas, float[] pos, float r, float stemW) {
+        if (pos == null) return;
+        float cx = pos[0];
+        float cy = pos[1];
+        float ax = pos[2];
+        float ay = pos[3];
+        canvas.drawRect(cx - stemW / 2f, Math.min(cy, ay),
+                cx + stemW / 2f, Math.max(cy, ay), decoPaint);
+        canvas.drawCircle(cx, cy, r, decoPaint);
     }
 
     /* ------------------------------------------------------------- 绘制 */
@@ -215,8 +286,11 @@ public class TerminalView extends View {
                 canvas.drawRect(0, top, getWidth(), top + cellH, fillPaint);
             }
             drawBackgrounds(canvas, line, top);
+            if (selecting) drawSelectionRow(canvas, topIndex + row, top);
             drawText(canvas, line, top);
         }
+
+        if (selecting) drawHandles(canvas, topIndex);
 
         // 光标只在贴底时显示
         if (scrollPx < 0.5f && buffer.cursorVisible && cursorOn && !buffer.isAltScreen()) {
@@ -413,6 +487,13 @@ public class TerminalView extends View {
                 longPressed = false;
                 downX = ev.getX();
                 downY = ev.getY();
+                if (selecting) {
+                    // 选中模式下：按到手柄就拖它，按到别处就退出选中
+                    dragHandle = handleHit(ev.getX(), ev.getY());
+                    if (dragHandle == 0) clearTextSelection();
+                    cancelPendingLongPress();
+                    return true;
+                }
                 if (selIndex >= 0) {
                     selIndex = -1;
                     invalidate();
@@ -424,13 +505,30 @@ public class TerminalView extends View {
                     selIndex = indexAtY(downY);
                     invalidate();
                     performHapticFeedback(HapticFeedbackConstants.LONG_PRESS);
-                    if (listener != null) listener.onLongPress(downY);
+                    if (listener != null) listener.onLongPress(downX, downY);
                 };
                 longPressHandler.postDelayed(longPressTask,
                         ViewConfiguration.getLongPressTimeout());
                 return true;
             }
             case MotionEvent.ACTION_MOVE: {
+                if (selecting) {
+                    if (dragHandle != 0) {
+                        int index = clampIndex(indexAtY(ev.getY()));
+                        int col = colAtX(index, ev.getX());
+                        if (dragHandle == 1) {
+                            selStartIndex = index;
+                            selStartCol = col;
+                        } else {
+                            selEndIndex = index;
+                            selEndCol = col;
+                        }
+                        normalizeSelection();
+                        invalidate();
+                    }
+                    // 选中模式下不滚动：没按手柄的滑动直接忽略
+                    return true;
+                }
                 if (tracker != null) tracker.addMovement(ev);
                 float dy = lastY - ev.getY();
                 int slop = ViewConfiguration.get(getContext()).getScaledTouchSlop();
@@ -448,6 +546,10 @@ public class TerminalView extends View {
             }
             case MotionEvent.ACTION_UP: {
                 cancelPendingLongPress();
+                if (selecting) {
+                    dragHandle = 0;
+                    return true;
+                }
                 if (tracker != null) {
                     tracker.addMovement(ev);
                     tracker.computeCurrentVelocity(1000);
@@ -465,6 +567,7 @@ public class TerminalView extends View {
             }
             case MotionEvent.ACTION_CANCEL: {
                 cancelPendingLongPress();
+                dragHandle = 0;
                 if (tracker != null) {
                     tracker.recycle();
                     tracker = null;
@@ -501,6 +604,93 @@ public class TerminalView extends View {
             selIndex = -1;
             invalidate();
         }
+    }
+
+    /* ------------------------------------------------------- 文字选中 API */
+
+    /** 从触摸点开始文字选中：起止都在按住的那个格子，之后拖手柄调整 */
+    public void startTextSelection(float x, float y) {
+        selIndex = -1;
+        int index = clampIndex(indexAtY(y));
+        int col = colAtX(index, x);
+        selStartIndex = index;
+        selStartCol = col;
+        selEndIndex = index;
+        selEndCol = col;
+        dragHandle = 0;
+        selecting = true;
+        invalidate();
+        if (listener != null) listener.onTextSelection(true);
+    }
+
+    public boolean hasTextSelection() {
+        return selecting;
+    }
+
+    /** 选中区间的文本，没在选中返回空串 */
+    public String selectedText() {
+        if (!selecting) return "";
+        return buffer.textInRange(selStartIndex, selStartCol, selEndIndex, selEndCol);
+    }
+
+    /** 退出文字选中模式 */
+    public void clearTextSelection() {
+        if (!selecting) return;
+        selecting = false;
+        dragHandle = 0;
+        selStartIndex = -1;
+        selEndIndex = -1;
+        invalidate();
+        if (listener != null) listener.onTextSelection(false);
+    }
+
+    /** 触摸点落在哪个手柄上：0 都没按到，1 起点，2 终点 */
+    private int handleHit(float x, float y) {
+        int topIndex = buffer.scrollbackSize() - Math.round(scrollPx / cellH);
+        float touchR = 28f * getResources().getDisplayMetrics().density;
+        float[] start = handlePos(selStartIndex, selStartCol, true, topIndex);
+        if (start != null && dist(x, y, start[0], start[1]) <= touchR) return 1;
+        float[] end = handlePos(selEndIndex, selEndCol, false, topIndex);
+        if (end != null && dist(x, y, end[0], end[1]) <= touchR) return 2;
+        return 0;
+    }
+
+    private static float dist(float x1, float y1, float x2, float y2) {
+        float dx = x1 - x2;
+        float dy = y1 - y2;
+        return (float) Math.sqrt(dx * dx + dy * dy);
+    }
+
+    /** 起点跑到终点后面就互换，拖的手柄也跟着换，这样手柄不会交叉打架 */
+    private void normalizeSelection() {
+        if (selStartIndex > selEndIndex
+                || (selStartIndex == selEndIndex && selStartCol > selEndCol)) {
+            int ti = selStartIndex;
+            int tc = selStartCol;
+            selStartIndex = selEndIndex;
+            selStartCol = selEndCol;
+            selEndIndex = ti;
+            selEndCol = tc;
+            if (dragHandle == 1) dragHandle = 2;
+            else if (dragHandle == 2) dragHandle = 1;
+        }
+    }
+
+    /** 统一行号夹到合法范围 */
+    private int clampIndex(int index) {
+        return Math.max(0, Math.min(buffer.scrollbackSize() + buffer.rows - 1, index));
+    }
+
+    /** 横坐标换算成列，落在宽字符第二格时回退到第一格 */
+    private int colAtX(int index, float x) {
+        int col = (int) (x / cellW);
+        col = Math.max(0, Math.min(buffer.cols - 1, col));
+        TerminalBuffer.Line line = buffer.lineAtIndex(index);
+        if (line != null && col > 0 && col < buffer.cols
+                && (line.at[col] & TerminalBuffer.ATTR_WIDE_TAIL) != 0) {
+            col--;
+        }
+        return col;
     }
 
     @Override

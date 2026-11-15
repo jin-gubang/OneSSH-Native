@@ -38,6 +38,7 @@ public class HostEditActivity extends Activity {
     private Widgets.Field userField;
     private LinearLayout groupHost;
     private LinearLayout jumpHost;
+    private Widgets.Toggle moshToggle;
     private Widgets.Field noteField;
     private Widgets.Field passField;
     private Widgets.Field keyBodyField;
@@ -163,6 +164,23 @@ public class HostEditActivity extends Activity {
         Widgets.top(jumpHost, 12);
         card.addView(jumpHost);
         renderJumpRow();
+
+        // Mosh：走 UDP 的可漫游终端，断网、换网不断线；服务器要装 mosh-server
+        LinearLayout moshRow = UI.row(this);
+        moshRow.setGravity(Gravity.CENTER_VERTICAL);
+        LinearLayout moshCol = UI.column(this);
+        moshCol.addView(UI.medium(this, "使用 Mosh", 13.5f, UI.INK));
+        TextView moshSub = UI.text(this,
+                "用 Mosh 而不是 SSH 连接：断网、换网不断线，需服务器装 mosh-server 并放行 UDP 端口",
+                11f, UI.MUTED);
+        moshSub.setLineSpacing(UI.dp(3), 1f);
+        moshCol.addView(moshSub);
+        moshRow.addView(moshCol, new LinearLayout.LayoutParams(0,
+                ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+        moshToggle = new Widgets.Toggle(this, draft.mosh);
+        moshRow.addView(moshToggle);
+        Widgets.top(moshRow, 12);
+        card.addView(moshRow);
 
         return card;
     }
@@ -472,6 +490,11 @@ public class HostEditActivity extends Activity {
         draft.group = draft.group == null ? "" : draft.group.trim();
         draft.note = noteField.text().trim();
         draft.authType = authType;
+        draft.mosh = moshToggle != null && moshToggle.isChecked();
+        if (draft.mosh && draft.jumpId != null && !draft.jumpId.isEmpty()) {
+            UI.toast(this, "Mosh 暂不支持跳板机：请先去掉跳板机，或关掉“使用 Mosh”");
+            return;
+        }
 
         if (Host.AUTH_PASSWORD.equals(authType)) {
             if (draft.credId.isEmpty() && password != null && !password.isEmpty()) {
