@@ -10,6 +10,7 @@ import android.os.Bundle;
 import android.view.Gravity;
 import android.view.View;
 import android.view.ViewGroup;
+import android.widget.ImageView;
 import android.widget.LinearLayout;
 import android.widget.ScrollView;
 import android.widget.TextView;
@@ -37,6 +38,9 @@ public class SettingsActivity extends Activity {
 
     private Store store;
     private LinearLayout root;
+
+    /** 安全卡片默认折起来；点标题展开，删主机重建页面时保持展开状态 */
+    private boolean securityExpanded;
 
     /* 导出文件时先把文本攒着，等用户选好位置再写 */
     private String pendingExport;
@@ -69,16 +73,17 @@ public class SettingsActivity extends Activity {
         body.addView(term);
         Widgets.bottom(term, 14);
 
-        /* 安全 */
-        LinearLayout sec = Widgets.cardBox(this);
-        sec.addView(Widgets.cardTitle(this, getString(R.string.settings_security)));
-
+        /* 安全：默认折起来，点标题展开；标题右边显示已信任主机数 */
         Map<String, String> known = store.knownHosts();
-        if (known.isEmpty()) {
-            sec.addView(UI.text(this, getString(R.string.settings_known_empty), 12f, UI.MUTED2));
-        } else {
-            for (Map.Entry<String, String> e : known.entrySet()) {
-                sec.addView(knownRow(e.getKey(), e.getValue()));
+        LinearLayout sec = Widgets.cardBox(this);
+        sec.addView(securityHeader(known.size()));
+        if (securityExpanded) {
+            if (known.isEmpty()) {
+                sec.addView(UI.text(this, getString(R.string.settings_known_empty), 12f, UI.MUTED2));
+            } else {
+                for (Map.Entry<String, String> e : known.entrySet()) {
+                    sec.addView(knownRow(e.getKey(), e.getValue()));
+                }
             }
         }
         body.addView(sec);
@@ -412,6 +417,38 @@ public class SettingsActivity extends Activity {
         sw.setOnChange(store::setKeepAwake);
         row.addView(sw);
         return row;
+    }
+
+    /** 安全卡片的标题行：跟首页分组一样的折叠样式——chevron + 标题，数量放最右边 */
+    private View securityHeader(int count) {
+        LinearLayout head = UI.row(this);
+        head.setBackground(UI.ripple(0x00000000, 8f));
+        head.setPadding(0, 0, 0, UI.dp(12));
+
+        ImageView chev = UI.icon(this, "chevron", UI.MUTED, 12);
+        chev.setRotation(securityExpanded ? 90f : 0f);
+        head.addView(chev);
+
+        TextView title = UI.medium(this, getString(R.string.settings_security), 12f, UI.MUTED);
+        title.setLetterSpacing(0.06f);
+        LinearLayout.LayoutParams tp = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        tp.leftMargin = UI.dp(7);
+        title.setLayoutParams(tp);
+        head.addView(title);
+
+        View spacer = new View(this);
+        spacer.setLayoutParams(new LinearLayout.LayoutParams(0,
+                ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+        head.addView(spacer);
+
+        head.addView(UI.text(this, count + " 台", 11f, UI.MUTED2));
+
+        head.setOnClickListener(v -> {
+            securityExpanded = !securityExpanded;
+            build();
+        });
+        return head;
     }
 
     private View knownRow(String hostPort, String fingerprint) {
