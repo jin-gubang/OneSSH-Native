@@ -15,6 +15,7 @@ import android.widget.ScrollView;
 import android.widget.TextView;
 
 import com.onessh.app.data.HostIO;
+import com.onessh.app.data.SnippetIO;
 import com.onessh.app.data.Store;
 import com.onessh.app.ui.Dialogs;
 import com.onessh.app.ui.UI;
@@ -31,6 +32,8 @@ public class SettingsActivity extends Activity {
 
     private static final int REQ_IMPORT_FILE = 201;
     private static final int REQ_EXPORT_FILE = 202;
+    private static final int REQ_IMPORT_SNIPPETS = 101;
+    private static final int REQ_EXPORT_SNIPPETS = 102;
 
     private Store store;
     private LinearLayout root;
@@ -92,6 +95,14 @@ public class SettingsActivity extends Activity {
         exportBtn.setOnClickListener(v -> exportSheet());
         data.addView(exportBtn);
         Widgets.bottom(exportBtn, 8);
+        LinearLayout importSnippetBtn = Widgets.button(this, "导入片段", "download", false);
+        importSnippetBtn.setOnClickListener(v -> importSnippetSheet());
+        data.addView(importSnippetBtn);
+        Widgets.bottom(importSnippetBtn, 8);
+        LinearLayout exportSnippetBtn = Widgets.button(this, "导出片段", "upload", false);
+        exportSnippetBtn.setOnClickListener(v -> exportSnippetSheet());
+        data.addView(exportSnippetBtn);
+        Widgets.bottom(exportSnippetBtn, 8);
         data.addView(UI.hline(this, UI.LINE2));
         LinearLayout clear = Widgets.button(this, getString(R.string.settings_clear), "trash", false);
         ((TextView) clear.getChildAt(1)).setTextColor(UI.RED);
@@ -205,6 +216,96 @@ public class SettingsActivity extends Activity {
         }
     }
 
+    /* ------------------------------------------------------------- 导入 / 导出（片段） */
+
+    private void importSnippetSheet() {
+        Dialogs.sheet(this, "导入片段",
+                new String[]{"从剪贴板导入", "从文件导入"},
+                new String[]{"clipboard", "folder"}, -1, idx -> {
+                    if (idx == 0) importSnippetFromClipboard();
+                    else importSnippetFromFile();
+                });
+    }
+
+    private void exportSnippetSheet() {
+        Dialogs.sheet(this, "导出片段",
+                new String[]{"复制到剪贴板", "保存到文件"},
+                new String[]{"clipboard", "folder"}, -1, idx -> {
+                    if (idx == 0) exportSnippetToClipboard();
+                    else exportSnippetToFile();
+                });
+    }
+
+    private void importSnippetFromClipboard() {
+        ClipboardManager cm = (ClipboardManager) getSystemService(Context.CLIPBOARD_SERVICE);
+        if (cm == null || !cm.hasPrimaryClip()) {
+            UI.toast(this, "剪贴板里没有内容");
+            return;
+        }
+        ClipData clip = cm.getPrimaryClip();
+        if (clip == null || clip.getItemCount() == 0) {
+            UI.toast(this, "剪贴板里没有内容");
+            return;
+        }
+        CharSequence text = clip.getItemAt(0).getText();
+        if (text == null || text.toString().trim().isEmpty()) {
+            UI.toast(this, "剪贴板里没有内容");
+            return;
+        }
+        doImportSnippet(text.toString());
+    }
+
+    private void importSnippetFromFile() {
+        Intent i = new Intent(Intent.ACTION_OPEN_DOCUMENT);
+        i.addCategory(Intent.CATEGORY_OPENABLE);
+        i.setType("*/*");
+        try {
+            startActivityForResult(i, REQ_IMPORT_SNIPPETS);
+        } catch (Exception e) {
+            UI.toast(this, "没有可用的文件选择器");
+        }
+    }
+
+    private void doImportSnippet(String text) {
+        SnippetIO.ImportData data;
+        try {
+            data = SnippetIO.parse(text);
+        } catch (Exception e) {
+            UI.toast(this, "导入失败：不是有效的片段导出文件");
+            return;
+        }
+        if (data.snippets.isEmpty() && data.groups.isEmpty()) {
+            UI.toast(this, "没有可导入的片段");
+            return;
+        }
+        SnippetIO.MergeResult r = SnippetIO.merge(store, data);
+        UI.toast(this, "导入完成：新增 " + r.snippetsAdded + " 条片段、"
+                + r.groupsAdded + " 个分组"
+                + (r.snippetsSkipped > 0 ? "，跳过 " + r.snippetsSkipped + " 条重复" : ""));
+        // 片段列表在 SnippetsActivity 里，返回时 onResume 会重新渲染，这里不用刷
+    }
+
+    private void exportSnippetToClipboard() {
+        String json = SnippetIO.exportJson(store.snippetGroups(), store.snippets());
+        ClipboardManager cm = (ClipboardManager) getSystemService(Context.CLIPBOARD_SERVICE);
+        if (cm == null) return;
+        cm.setPrimaryClip(ClipData.newPlainText("snippets", json));
+        UI.toast(this, "已复制到剪贴板");
+    }
+
+    private void exportSnippetToFile() {
+        pendingExport = SnippetIO.exportJson(store.snippetGroups(), store.snippets());
+        Intent i = new Intent(Intent.ACTION_CREATE_DOCUMENT);
+        i.addCategory(Intent.CATEGORY_OPENABLE);
+        i.setType("application/json");
+        i.putExtra(Intent.EXTRA_TITLE, SnippetIO.exportFileName());
+        try {
+            startActivityForResult(i, REQ_EXPORT_SNIPPETS);
+        } catch (Exception e) {
+            UI.toast(this, "没有可用的文件选择器");
+        }
+    }
+
     @Override
     protected void onActivityResult(int requestCode, int resultCode, Intent data) {
         super.onActivityResult(requestCode, resultCode, data);
@@ -222,6 +323,29 @@ public class SettingsActivity extends Activity {
                 UI.toast(this, "导入失败：" + e.getMessage());
             }
         } else if (requestCode == REQ_EXPORT_FILE) {
+            if (pendingExport == null) return;
+            try (OutputStream out = getContentResolver().openOutputStream(uri)) {
+                if (out == null) throw new Exception("写不到文件");
+                out.write(pendingExport.getBytes(StandardCharsets.UTF_8));
+                out.flush();
+                UI.toast(this, "已导出");
+            } catch (Exception e) {
+                UI.toast(this, "导出失败：" + e.getMessage());
+            } finally {
+                pendingExport = null;
+            }
+        } else if (requestCode == REQ_IMPORT_SNIPPETS) {
+            try (InputStream in = getContentResolver().openInputStream(uri)) {
+                if (in == null) throw new Exception("读不到文件");
+                ByteArrayOutputStream bos = new ByteArrayOutputStream();
+                byte[] buf = new byte[8192];
+                int n;
+                while ((n = in.read(buf)) > 0) bos.write(buf, 0, n);
+                doImportSnippet(new String(bos.toByteArray(), StandardCharsets.UTF_8));
+            } catch (Exception e) {
+                UI.toast(this, "导入失败：" + e.getMessage());
+            }
+        } else if (requestCode == REQ_EXPORT_SNIPPETS) {
             if (pendingExport == null) return;
             try (OutputStream out = getContentResolver().openOutputStream(uri)) {
                 if (out == null) throw new Exception("写不到文件");
